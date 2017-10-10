@@ -633,11 +633,24 @@ void _vertexTransformAndAssembly(
 	// vertex id
 	int vid = (blockIdx.x * blockDim.x) + threadIdx.x;
 	if (vid < numVertices) {
+		VertexIndex vertexIndex = primitive.dev_indices[vid];
+		VertexOut &ref_vs_output = primitive.dev_verticesOut[vertexIndex];
+
+		ref_vs_output.texcoord0 = primitive.dev_texcoord0[vertexIndex];
+		ref_vs_output.pos = glm::vec4(primitive.dev_position[vertexIndex], 1.0f);
+		glm::vec3 NDCpos = glm::vec3(ref_vs_output.pos);
+		NDCpos.x = (NDCpos.x - (width / 2)) / (float)(width / 2);
+		NDCpos.y = ((height / 2) - NDCpos.y) / (float)(height / 2);
+		ref_vs_output.eyePos = NDCpos;
+		ref_vs_output.eyeNor = primitive.dev_normal[vertexIndex];
+		ref_vs_output.dev_diffuseTex = primitive.dev_diffuseTex;
 
 		// TODO: Apply vertex transformation here
 		// Multiply the MVP matrix for each vertex position, this will transform everything into clipping space
 		// Then divide the pos by its w element to transform into NDC space
 		// Finally transform x and y to viewport space
+
+		//basic 
 
 		// TODO: Apply vertex assembly here
 		// Assemble all attribute arraies into the primitive array
