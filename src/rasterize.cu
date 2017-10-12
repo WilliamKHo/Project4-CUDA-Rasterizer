@@ -639,8 +639,8 @@ void _vertexTransformAndAssembly(
 		//primitive.dev_verticesOut[vid].texcoord0 = primitive.dev_texcoord0[vid];
 		ref_vs_output.pos = glm::vec4(primitive.dev_position[vid], 1.0f);
 		glm::vec3 NDCpos = glm::vec3(ref_vs_output.pos);
-		NDCpos.x = (NDCpos.x - (width / 2)) / (float)(width / 2);
-		NDCpos.y = ((height / 2) - NDCpos.y) / (float)(height / 2);
+		//NDCpos.x = (NDCpos.x - (width / 2)) / (float)(width / 2);
+		//NDCpos.y = ((height / 2) - NDCpos.y) / (float)(height / 2);
 		ref_vs_output.eyePos = NDCpos;
 		//ref_vs_output.eyeNor = primitive.dev_normal[vid];
 		//ref_vs_output.dev_diffuseTex = primitive.dev_diffuseTex;
@@ -699,8 +699,43 @@ glm::vec3 getBarycentricWeights(glm::vec3 p, glm::vec3 p1, glm::vec3 p2, glm::ve
 
 __device__ 
 bool isInTriangle(glm::vec3 p, glm::vec3 p1 , glm::vec3 p2 , glm::vec3 p3 ) {
-	glm::vec3 bw = getBarycentricWeights(p, p1, p2, p3);
-	return bw.x + bw.y + bw.z > 1.0f;
+	float totalArea = glm::length(glm::cross(p1 - p3, p2 - p3)) / 2.0f;
+
+	float area1 = glm::length(glm::cross(p2 - p, p3 - p)) / 2.0f;
+	float area2 = glm::length(glm::cross(p3 - p, p1 - p)) / 2.0f;
+	float area3 = glm::length(glm::cross(p1 - p, p2 - p)) / 2.0f;
+
+	glm::vec3 bw = glm::vec3(area1 / totalArea, area2 / totalArea, area3 / totalArea);
+
+	return (bw.x + bw.y + bw.z) > 1.0f;
+}
+
+/**
+* Computes the axis-aligned bounding box for a given prim
+* Outputs:
+* glm::ivec4 Contains pixel coordinates for left bottom and top right corners of AABB
+*/
+__device__
+glm::ivec4 computeAABB(int width, int height, Primitive prim) {
+	float maxX = fmaxf(prim.v[0].pos.x, fmaxf(prim.v[1].pos.x, prim.v[2].pos.x));
+	float maxY = fmaxf(prim.v[0].pos.y, fmaxf(prim.v[1].pos.y, prim.v[2].pos.y));
+	float minX = fminf(prim.v[0].pos.x, fminf(prim.v[1].pos.x, prim.v[2].pos.x));
+	float minY = fminf(prim.v[0].pos.y, fminf(prim.v[1].pos.y, prim.v[2].pos.y));
+
+	return glm::vec4(
+		(int) (minX * (width / 2)),
+		(int) (minY * (height / 2)),
+		(int) (maxX * (width / 2)),
+		(int) (maxY * (height / 2))
+	);
+}
+
+/**
+* Converts pixel coordinates to fragment index
+*/
+__device__
+int pixelToFragIndex(int x, int y, int width, int height) {
+	return (width * height) - (x + y * width + ((width * height) / 2) - width / 2);
 }
 
 __global__
@@ -710,11 +745,19 @@ void rasterizeTriangles(int numPrimitives,
 	Primitive* dev_primitives, 
 	Fragment* dev_fragmentBuffer) {
 	int primId = (blockIdx.x * blockDim.x) + threadIdx.x;
-	printf("here\n");
-	if (primId == 0) {
-		for (int x = 300; x < 500; x++) {
-			for (int y = 300; y < 500; y++) {
-				dev_fragmentBuffer[x + y * width].color = glm::vec3(0.9f, 0.0f, 0.0f);
+	if (primId < numPrimitives) {
+		Primitive primitive = dev_primitives[primId];
+		glm::ivec4 AABB = computeAABB(width, height, primitive);
+		glm::vec3 p1 = glm::vec3(primitive.v[0].pos);
+		glm::vec3 p2 = glm::vec3(primitive.v[1].pos);
+		glm::vec3 p3 = glm::vec3(primitive.v[2].pos);
+
+		for (int y = AABB.y; y < AABB.w; y++) {
+			for (int x = AABB.x; x < AABB.z; x++) {
+				if (isInTriangle(glm::vec3(x, y, 0), p1, p2, p3)) {
+					int fragIndex = pixelToFragIndex(x, y, width, height);
+					dev_fragmentBuffer[fragIndex].color = glm::vec3(0.9f, 0.0f, 0.0f);
+				}
 			}
 		}
 	}
