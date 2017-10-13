@@ -638,6 +638,7 @@ void _vertexTransformAndAssembly(
 		//
 		//primitive.dev_verticesOut[vid].texcoord0 = primitive.dev_texcoord0[vid];
 		ref_vs_output.pos = glm::vec4(primitive.dev_position[vid], 1.0f);
+		printf("%f, %f, %f, %f\n", ref_vs_output.pos.x, ref_vs_output.pos.y, ref_vs_output.pos.z, ref_vs_output.pos.w);
 		glm::vec3 NDCpos = glm::vec3(ref_vs_output.pos);
 		//NDCpos.x = (NDCpos.x - (width / 2)) / (float)(width / 2);
 		//NDCpos.y = ((height / 2) - NDCpos.y) / (float)(height / 2);
@@ -699,15 +700,13 @@ glm::vec3 getBarycentricWeights(glm::vec3 p, glm::vec3 p1, glm::vec3 p2, glm::ve
 
 __device__ 
 bool isInTriangle(glm::vec3 p, glm::vec3 p1 , glm::vec3 p2 , glm::vec3 p3 ) {
-	float totalArea = glm::length(glm::cross(p1 - p3, p2 - p3)) / 2.0f;
-
-	float area1 = glm::length(glm::cross(p2 - p, p3 - p)) / 2.0f;
-	float area2 = glm::length(glm::cross(p3 - p, p1 - p)) / 2.0f;
-	float area3 = glm::length(glm::cross(p1 - p, p2 - p)) / 2.0f;
-
+	float totalArea = glm::abs((p1.x * (p2.y - p3.y) + p2.x * (p3.y - p1.y) + p3.x * (p1.y - p2.y)) / 2.0f);
+	
+	float area1 = glm::abs((p.x * (p2.y - p3.y) + p2.x * (p3.y - p.y) + p3.x * (p.y - p2.y)) / 2.0f);
+	float area2 = glm::abs((p1.x * (p.y - p3.y) + p.x * (p3.y - p1.y) + p3.x * (p1.y - p.y)) / 2.0f);
+	float area3 = glm::abs((p1.x * (p2.y - p.y) + p2.x * (p.y - p1.y) + p.x * (p1.y - p2.y)) / 2.0f);	
 	glm::vec3 bw = glm::vec3(area1 / totalArea, area2 / totalArea, area3 / totalArea);
-
-	return (bw.x + bw.y + bw.z) > 1.0f;
+	return !((bw.x + bw.y + bw.z) > 1.00001f);
 }
 
 /**
@@ -723,10 +722,10 @@ glm::ivec4 computeAABB(int width, int height, Primitive prim) {
 	float minY = fminf(prim.v[0].pos.y, fminf(prim.v[1].pos.y, prim.v[2].pos.y));
 
 	return glm::vec4(
-		(int) (minX * (width / 2)),
-		(int) (minY * (height / 2)),
-		(int) (maxX * (width / 2)),
-		(int) (maxY * (height / 2))
+		(int) ((minX + 1.0f) * (width / 2)),
+		(int) ((1.0f - maxY) * (height / 2)),
+		(int) ((maxX + 1.0f) * (width / 2)),
+		(int) ((1.0f - minY) * (height / 2))
 	);
 }
 
@@ -735,7 +734,12 @@ glm::ivec4 computeAABB(int width, int height, Primitive prim) {
 */
 __device__
 int pixelToFragIndex(int x, int y, int width, int height) {
-	return (width * height) - (x + y * width + ((width * height) / 2) - width / 2);
+	return y * width - x;
+}
+
+__device__
+glm::vec3 NDCtoPixel(glm::vec3 p, int width, int height) {
+	return glm::vec3((p.x + 1.0f) * (width / 2), (1.0f - p.y) * (height / 2), p.z);
 }
 
 __global__
@@ -746,15 +750,15 @@ void rasterizeTriangles(int numPrimitives,
 	Fragment* dev_fragmentBuffer) {
 	int primId = (blockIdx.x * blockDim.x) + threadIdx.x;
 	if (primId < numPrimitives) {
-		Primitive primitive = dev_primitives[primId];
+		Primitive& primitive = dev_primitives[primId];
 		glm::ivec4 AABB = computeAABB(width, height, primitive);
-		glm::vec3 p1 = glm::vec3(primitive.v[0].pos);
-		glm::vec3 p2 = glm::vec3(primitive.v[1].pos);
-		glm::vec3 p3 = glm::vec3(primitive.v[2].pos);
-
+		glm::vec3 pPix1 = NDCtoPixel(glm::vec3(primitive.v[0].pos), width, height);
+		glm::vec3 pPix2 = NDCtoPixel(glm::vec3(primitive.v[1].pos), width, height);
+		glm::vec3 pPix3 = NDCtoPixel(glm::vec3(primitive.v[2].pos), width, height);
 		for (int y = AABB.y; y < AABB.w; y++) {
 			for (int x = AABB.x; x < AABB.z; x++) {
-				if (isInTriangle(glm::vec3(x, y, 0), p1, p2, p3)) {
+				//Something is wrong with the conversion in the Axis aligne bounding box. These aren't printing out correct numbers:
+				if (isInTriangle(glm::vec3(x, y, 0.0f), pPix1, pPix2, pPix3)) {
 					int fragIndex = pixelToFragIndex(x, y, width, height);
 					dev_fragmentBuffer[fragIndex].color = glm::vec3(0.9f, 0.0f, 0.0f);
 				}
@@ -825,7 +829,7 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 	dim3 numBlocksForRasterization((curPrimitiveBeginId + threadsPerBlock.x - 1) / threadsPerBlock.x);
 	
 	 //TODO: rasterize
-	rasterizeTriangles << <1, 32 >> > 
+	rasterizeTriangles << <numBlocksForRasterization, threadsPerBlock >> > 
 		(curPrimitiveBeginId, 
 		width,
 		height, 
