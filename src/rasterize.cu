@@ -103,6 +103,7 @@ static std::map<std::string, std::vector<PrimitiveDevBufPointers>> mesh2Primitiv
 
 static int width = 0;
 static int height = 0;
+static float depthRange = 5000000.0f;
 
 static int totalNumPrimitives = 0;
 static Primitive *dev_primitives = NULL;
@@ -110,6 +111,7 @@ static Fragment *dev_fragmentBuffer = NULL;
 static glm::vec3 *dev_framebuffer = NULL;
 
 static int * dev_depth = NULL;	// you might need this buffer when doing depth test
+static int * mutex = NULL;
 
 /**
  * Kernel that writes the image to the OpenGL PBO directly.
@@ -165,6 +167,9 @@ void rasterizeInit(int w, int h) {
     
 	cudaFree(dev_depth);
 	cudaMalloc(&dev_depth, width * height * sizeof(int));
+
+	cudaFree(mutex);
+	cudaMalloc(&mutex, sizeof(int));
 
 	checkCUDAError("rasterizeInit");
 }
@@ -637,12 +642,11 @@ void _vertexTransformAndAssembly(
 		VertexOut &ref_vs_output = primitive.dev_verticesOut[vid];
 		//
 		//primitive.dev_verticesOut[vid].texcoord0 = primitive.dev_texcoord0[vid];
-		ref_vs_output.pos = glm::vec4(primitive.dev_position[vid], 1.0f);
-		printf("%f, %f, %f, %f\n", ref_vs_output.pos.x, ref_vs_output.pos.y, ref_vs_output.pos.z, ref_vs_output.pos.w);
-		glm::vec3 NDCpos = glm::vec3(ref_vs_output.pos);
-		//NDCpos.x = (NDCpos.x - (width / 2)) / (float)(width / 2);
-		//NDCpos.y = ((height / 2) - NDCpos.y) / (float)(height / 2);
-		ref_vs_output.eyePos = NDCpos;
+		glm::vec4 pos = glm::vec4(primitive.dev_position[vid], 1.0f);
+		ref_vs_output.pos = MVP * pos;
+		ref_vs_output.eyePos = glm::vec3(MV * pos);
+		ref_vs_output.eyeNor = glm::vec3(MV_normal * primitive.dev_normal[vid]);
+
 		//ref_vs_output.eyeNor = primitive.dev_normal[vid];
 		//ref_vs_output.dev_diffuseTex = primitive.dev_diffuseTex;
 
@@ -696,7 +700,7 @@ glm::vec3 getBarycentricWeights(glm::vec3 p, glm::vec3 p1, glm::vec3 p2, glm::ve
 	float area3 = glm::length(glm::cross(p1 - p, p2 - p)) / 2.0f;
 
 	return glm::vec3(area1 / totalArea, area2 / totalArea, area3 / totalArea);
-}
+} 
 
 __device__ 
 bool isInTriangle(glm::vec3 p, glm::vec3 p1 , glm::vec3 p2 , glm::vec3 p3 ) {
@@ -722,10 +726,10 @@ glm::ivec4 computeAABB(int width, int height, Primitive prim) {
 	float minY = fminf(prim.v[0].pos.y, fminf(prim.v[1].pos.y, prim.v[2].pos.y));
 
 	return glm::vec4(
-		(int) ((minX + 1.0f) * (width / 2)),
-		(int) ((1.0f - maxY) * (height / 2)),
-		(int) ((maxX + 1.0f) * (width / 2)),
-		(int) ((1.0f - minY) * (height / 2))
+		(int) ((minX + 1.0f) * (width / 2)) - 1,
+		(int) ((1.0f - maxY) * (height / 2)) - 1, //Necessary to flip max and min Y because in pixel space, 0,0 is the top left
+		(int) ((maxX + 1.0f) * (width / 2)) + 1,
+		(int) ((1.0f - minY) * (height / 2) + 1)
 	);
 }
 
@@ -742,12 +746,47 @@ glm::vec3 NDCtoPixel(glm::vec3 p, int width, int height) {
 	return glm::vec3((p.x + 1.0f) * (width / 2), (1.0f - p.y) * (height / 2), p.z);
 }
 
+/* Takes in information in NDC and outputs z-depth
+*/
+
+__device__
+float computeFragmentDepth(glm::vec3 p, Primitive prim) {
+	glm::vec3 p1 = glm::vec3(prim.v[0].pos);
+	glm::vec3 p2 = glm::vec3(prim.v[1].pos);
+	glm::vec3 p3 = glm::vec3(prim.v[2].pos);
+
+	p1.z = 0.0f;
+	p2.z = 0.0f;
+	p3.z = 0.0f;
+
+	glm::vec3 eyePos1 = glm::vec3(prim.v[0].eyePos);
+	glm::vec3 eyePos2 = glm::vec3(prim.v[1].eyePos);
+	glm::vec3 eyePos3 = glm::vec3(prim.v[2].eyePos);
+
+	float totalArea = glm::length(glm::cross(p1 - p3, p2 - p3)) / 2.0f;
+
+	float area1 = glm::length(glm::cross(p2 - p, p3 - p)) / 2.0f;
+	float area2 = glm::length(glm::cross(p1 - p, p3 - p)) / 2.0f;
+	float area3 = glm::length(glm::cross(p1 - p, p2 - p)) / 2.0f;
+	glm::vec3 bw = glm::vec3(area1 / totalArea, area2 / totalArea, area3 / totalArea);
+
+	return 1.0f / ((1.0f / eyePos1.z) * bw.x + (1.0f / eyePos2.z) * bw.y + (1.0f / eyePos3.z)  * bw.z);
+}
+
+__device__
+glm::vec3 computeLambertian(glm::vec3 normal, glm::vec3 light, glm::vec3 baseColor) {
+	return fmaxf(glm::dot(glm::normalize(normal), glm::normalize(light)), 0.1f) * baseColor;
+}
+
 __global__
 void rasterizeTriangles(int numPrimitives, 
 	int width,
 	int height,
 	Primitive* dev_primitives, 
-	Fragment* dev_fragmentBuffer) {
+	Fragment* dev_fragmentBuffer,
+	int * dev_depth,
+	float depthRange,
+	int * mutex) {
 	int primId = (blockIdx.x * blockDim.x) + threadIdx.x;
 	if (primId < numPrimitives) {
 		Primitive& primitive = dev_primitives[primId];
@@ -755,17 +794,46 @@ void rasterizeTriangles(int numPrimitives,
 		glm::vec3 pPix1 = NDCtoPixel(glm::vec3(primitive.v[0].pos), width, height);
 		glm::vec3 pPix2 = NDCtoPixel(glm::vec3(primitive.v[1].pos), width, height);
 		glm::vec3 pPix3 = NDCtoPixel(glm::vec3(primitive.v[2].pos), width, height);
+		glm::vec3 tri[3] = {
+			pPix1, 
+			pPix2, 
+			pPix3 };
 		for (int y = AABB.y; y < AABB.w; y++) {
 			for (int x = AABB.x; x < AABB.z; x++) {
-				//Something is wrong with the conversion in the Axis aligne bounding box. These aren't printing out correct numbers:
-				if (isInTriangle(glm::vec3(x, y, 0.0f), pPix1, pPix2, pPix3)) {
+				glm::vec3 bw = calculateBarycentricCoordinate(tri, glm::vec2(x, y));
+				if (isBarycentricCoordInBounds(bw)) {
 					int fragIndex = pixelToFragIndex(x, y, width, height);
-					dev_fragmentBuffer[fragIndex].color = glm::vec3(0.9f, 0.0f, 0.0f);
+					//printf("%f\n", computeFragmentDepth(glm::vec3(x, y, 0.0f), primitive));
+					int depth = (int) (depthRange * -getZAtCoordinate(bw, tri));
+					//atomicMin(dev_depth + fragIndex, depth);
+					//if (depth == dev_depth[fragIndex]) dev_fragmentBuffer[fragIndex].color = glm::vec3((float) primId / (float) numPrimitives, 0.0f, 0.0f);
+					//printf("%i\n", depth);
+					bool isSet;
+					do {
+						isSet = (atomicCAS(mutex, 0, 1) == 0);
+						if (isSet) {
+							dev_depth[fragIndex] = min(dev_depth[fragIndex], depth);
+							if (depth == dev_depth[fragIndex]) dev_fragmentBuffer[fragIndex].color = primitive.v[0].eyeNor;
+
+						}
+						if (isSet) {
+							*mutex = 0;
+						}
+					} while (!isSet);
 				}
 			}
 		}
 	}
 
+}
+
+__global__
+void shadeLambertian(int numFragments, Fragment* dev_fragmentBuffer, glm::vec3 light) {
+	int idx = (blockIdx.x * blockDim.x) + threadIdx.x;
+	if (idx < numFragments) {
+		printf("%i\n", numFragments);
+		dev_fragmentBuffer[idx].color = glm::vec3(1.0f, 0.5f, 0.5f);
+	}
 }
 __global__
 void redFragments(int width, int height, Fragment* dev_fragmentBuffer) {
@@ -827,6 +895,10 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 
 	dim3 threadsPerBlock(128);
 	dim3 numBlocksForRasterization((curPrimitiveBeginId + threadsPerBlock.x - 1) / threadsPerBlock.x);
+
+	cudaMemset(mutex, 0, sizeof(int));
+
+	glm::vec3 light = glm::vec3(1.0f, 1.0f, 1.0f);
 	
 	 //TODO: rasterize
 	rasterizeTriangles << <numBlocksForRasterization, threadsPerBlock >> > 
@@ -834,7 +906,15 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 		width,
 		height, 
 		dev_primitives, 
-		dev_fragmentBuffer);
+		dev_fragmentBuffer,
+		dev_depth,
+		depthRange,
+		mutex);
+
+	shadeLambertian << <numBlocksForRasterization, threadsPerBlock >> > (
+		width * height,
+		dev_fragmentBuffer,
+		light);
 
 	//redFragments << <blockCount2d, blockSize2d >> > (width, height, dev_fragmentBuffer);
 	checkCUDAError("rasterization");
