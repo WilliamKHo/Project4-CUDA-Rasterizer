@@ -138,8 +138,8 @@ bool init(const tinygltf::Scene & scene) {
         return false;
     }
 
-    width = 400;
-    height = 400;
+    width = 100;
+    height = 100;
     window = glfwCreateWindow(width, height, "CIS 565 Pathtracer", NULL, NULL);
     if (!window) {
         glfwTerminate();
