@@ -842,6 +842,11 @@ int tileIndexToFragIndex(int tileIndex, int tileX, glm::ivec4 tile, int width, i
 	return pixelToFragIndex(tile.x + tileXcoord, tile.y + tileYcoord, width, height);
 }
 
+__device__
+bool pixelInTile(int x, int y, glm::ivec4 tile) {
+	return (x >= tile.x && x < tile.z && y >= tile.y && y < tile.w);
+}
+
 __global__
 void tileRasterizeTriangles(int numPrimitives,
 	int width,
@@ -872,7 +877,7 @@ void tileRasterizeTriangles(int numPrimitives,
 		//Evaluate bounding box and determine if the triangle needs to be rendered in this tile
 		Primitive& primitive = dev_primitives[primId];
 		glm::ivec4 AABB = computeAABB(width, height, primitive);
-		if (AABB.x > tile.z || AABB.z < tile.x || AABB.y > tile.w || AABB.w < tile.y) {
+		if (AABB.x >= tile.z || AABB.z < tile.x || AABB.y >= tile.w || AABB.w < tile.y) {
 			return;
 		}
 
@@ -887,38 +892,35 @@ void tileRasterizeTriangles(int numPrimitives,
 			for (int x = AABB.x; x < AABB.z; x++) {
 				//Test if pixel x,y is in the triangle
 				glm::vec3 bw = calculateBarycentricCoordinate(tri, glm::vec2(x, y));
-				if (isBarycentricCoordInBounds(bw)) {
+				if (isBarycentricCoordInBounds(bw) && pixelInTile(x, y, tile)) {
 					//Convert the pixel to a fragmentIndex and compute its depth
 					int fragIndex = pixelToFragIndex(x, y, width, height);
 					int fragTileIndex = (x - tile.x) + (y - tile.y) * TILEY;
-					printf("%i, %i, %i\n", fragTileIndex, x, y);
 					//Cull fragments outside of tile
-					if (fragTileIndex < TILESIZE && fragTileIndex > 0) {
-						float depth = (depthRange * -getZAtCoordinate(bw, tri));
-						//depth test, the mutex ensures that the code within "isSet" happens atomically
-						//that is, that code is guaranteed to execute in a single thread without anything executing in
-						//any other thread
-						bool isSet;
-						do {
-							isSet = (atomicCAS(mutex, 0, 1) == 0);
-							if (isSet) {
-								/*dev_depth[fragIndex] = min(dev_depth[fragIndex], (int)depth);
-								if (depth == dev_depth[fragIndex]) dev_fragmentBuffer[fragIndex].color = primitive.v[0].eyeNor;*/
-								float originalDepth = shared_tileBuffer[fragTileIndex].w;
-								shared_tileBuffer[fragTileIndex].w = fminf(originalDepth, depth);
-								if (depth < originalDepth) {
-									glm::vec3 color = primitive.v[0].eyeNor;
-									shared_tileBuffer[fragTileIndex].x = color.x;
-									shared_tileBuffer[fragTileIndex].y = color.y;
-									shared_tileBuffer[fragTileIndex].z = color.z;
+					float depth = (depthRange * -getZAtCoordinate(bw, tri));
+					//depth test, the mutex ensures that the code within "isSet" happens atomically
+					//that is, that code is guaranteed to execute in a single thread without anything executing in
+					//any other thread
+					bool isSet;
+					do {
+						isSet = (atomicCAS(mutex, 0, 1) == 0);
+						if (isSet) {
+							/*dev_depth[fragIndex] = min(dev_depth[fragIndex], (int)depth);
+							if (depth == dev_depth[fragIndex]) dev_fragmentBuffer[fragIndex].color = primitive.v[0].eyeNor;*/
+							float originalDepth = shared_tileBuffer[fragTileIndex].w;
+							shared_tileBuffer[fragTileIndex].w = fminf(originalDepth, depth);
+							if (depth < originalDepth) {
+								glm::vec3 color = primitive.v[0].eyeNor;
+								shared_tileBuffer[fragTileIndex].x = color.x;
+								shared_tileBuffer[fragTileIndex].y = color.y;
+								shared_tileBuffer[fragTileIndex].z = color.z;
 
-								}
 							}
-							if (isSet) {
-								*mutex = 0;
-							}
-						} while (!isSet);
-					}
+						}
+						if (isSet) {
+							*mutex = 0;
+						}
+					} while (!isSet);
 				}
 			}
 		}
@@ -1026,8 +1028,8 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 			dev_depth,
 			depthRange,
 			mutex,
-			1,
-			1);
+			2,
+			2);
 	tileRasterizeTriangles << <1, 128 >> >
 		(curPrimitiveBeginId,
 			width,
@@ -1037,8 +1039,8 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 			dev_depth,
 			depthRange,
 			mutex,
-			2,
-			2);
+			1,
+			1);
 
 #else
 	rasterizeTriangles << <numBlocksForRasterization, threadsPerBlock >> > 
