@@ -19,7 +19,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 
 #define TILERENDER 0
-#define TILERENDERWITHPREPROCESS 1
+#define TILERENDERWITHPREPROCESS 0
 //These need to be defined at compile time, but they need to be mathematically sound. TILEX * TILEY = TILESIZE
 #define TILEX 16
 #define TILEY 16
@@ -1217,10 +1217,10 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 		depthRange,
 		mutex);
 
-	shadeLambertian << <blockCount2d, blockSize2d >> > (
+	/*shadeLambertian << <blockCount2d, blockSize2d >> > (
 		width, height,
 		dev_fragmentBuffer,
-		light);
+		light);*/
 
 #endif
 	
