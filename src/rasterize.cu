@@ -18,11 +18,12 @@
 #include <glm/gtc/quaternion.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
-#define TILERENDER 1
+#define TILERENDER 0
+#define TILERENDERWITHPREPROCESS 1
 //These need to be defined at compile time, but they need to be mathematically sound. TILEX * TILEY = TILESIZE
-#define TILEX 25
-#define TILEY 25
-#define TILESIZE 625
+#define TILEX 32
+#define TILEY 32
+#define TILESIZE 1024
 
 namespace {
 
@@ -102,6 +103,13 @@ namespace {
 		// TODO: add more attributes when needed
 	};
 
+#if TILERENDERWITHPREPROCESS
+	struct Tile {
+		int numTriangles = 0;
+		int triangleIndices[1000];
+	};
+#endif
+
 }
 
 static std::map<std::string, std::vector<PrimitiveDevBufPointers>> mesh2PrimitivesMap;
@@ -115,6 +123,11 @@ static int totalNumPrimitives = 0;
 static Primitive *dev_primitives = NULL;
 static Fragment *dev_fragmentBuffer = NULL;
 static glm::vec3 *dev_framebuffer = NULL;
+
+#if TILERENDERWITHPREPROCESS
+static int *dev_triangleIndicesForFrag = NULL;
+static Tile *dev_tiles = NULL;
+#endif
 
 static int * dev_depth = NULL;	// you might need this buffer when doing depth test
 static int * mutex = NULL;
@@ -176,6 +189,14 @@ void rasterizeInit(int w, int h) {
 
 	cudaFree(mutex);
 	cudaMalloc(&mutex, sizeof(int));
+
+#if TILERENDERWITHPREPROCESS
+	cudaFree(dev_triangleIndicesForFrag);
+	cudaMalloc(&dev_triangleIndicesForFrag, width * height * sizeof(int));
+
+	cudaFree(dev_tiles);
+	cudaMalloc(&dev_tiles, ((width + TILEX - 1) / TILEX) * ((height + TILEY - 1) / TILEY) * sizeof(Tile));
+#endif
 
 	checkCUDAError("rasterizeInit");
 }
@@ -855,13 +876,13 @@ void tileRasterizeTriangles(int numPrimitives,
 	Fragment* dev_fragmentBuffer,
 	int * dev_depth,
 	float depthRange,
-	int * mutex,
-	int tileX,
-	int tileY) {
+	int * mutex) {
 	//Allocate shared memory for tile
 	//Format: x,y,z is color and w is depth
 	// On Moore 100 Machines, max shared memory is c000 (49152) bytes, 
 	// with this, shared memory usage is 40000 bytes
+	int tileX = blockIdx.x;
+	int tileY = blockIdx.y;
 	__shared__ glm::vec4 shared_tileBuffer[TILESIZE];
 	int sharedWritesPerThread = (TILESIZE + blockDim.x - 1) / blockDim.x;
 	for (int i = 0; i < sharedWritesPerThread; i++) {
@@ -939,17 +960,115 @@ void tileRasterizeTriangles(int numPrimitives,
 				width,
 				height);
 			dev_fragmentBuffer[fragIndex].color = glm::vec3(shared_tileBuffer[i + threadIdx.x * sharedWritesPerThread]);
-
 		}
 	}
 }
 
+
+#if TILERENDERWITHPREPROCESS
 __global__
-void shadeLambertian(int numFragments, Fragment* dev_fragmentBuffer, glm::vec3 light) {
-	int idx = (blockIdx.x * blockDim.x) + threadIdx.x;
-	if (idx < numFragments) {
-		printf("%i\n", numFragments);
-		dev_fragmentBuffer[idx].color = glm::vec3(1.0f, 0.5f, 0.5f);
+void computeTrianglesToBeRendered(int numPrimitives,
+	int width,
+	int height,
+	int tileGridWidth,
+	Primitive* dev_primitives,
+	Tile* dev_tiles,
+	int *mutex) {
+	//Parellelize over triangles
+	//Using AABB, bucket the triangles into the tiles
+	int primId = (blockIdx.x * blockDim.x) + threadIdx.x;
+	if (primId < numPrimitives) {
+		Primitive& primitive = dev_primitives[primId];
+		glm::ivec4 AABB = computeAABB(width, height, primitive);
+		int minX = (AABB.x / TILEX) * TILEX;
+		int minY = (AABB.y / TILEY) * TILEY;
+		for (int y = minY; y < AABB.w; y += TILEY) {
+			for (int x = minX; x < AABB.z; x += TILEX) {
+				Tile& tile = dev_tiles[(x / TILEX) + (y / TILEY) * tileGridWidth];
+				bool isSet;
+				do {
+					isSet = (atomicCAS(mutex, 0, 1) == 0);
+					if (isSet) {
+						int bucketIdx = tile.numTriangles;
+						tile.triangleIndices[bucketIdx] = primId;
+						tile.numTriangles++;
+					}
+					if (isSet) {
+						*mutex = 0;
+					}
+				} while (!isSet);
+			}
+		}
+	}
+
+}
+
+__global__
+void tileRasterizeTrianglesAfterPreProcess(
+	int width,
+	int height,
+	int tileGridWidth,
+	Primitive* dev_primitives,
+	Tile* dev_tiles,
+	Fragment* dev_fragmentBuffer) {
+	//Block is tile
+	//Thread is pixel
+	//Loop over the triangles in the bucket
+	
+	__shared__ glm::vec4 shared_tileBuffer[TILESIZE];
+
+	int tileX = blockIdx.x;
+	int tileY = blockIdx.y;
+	int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
+	int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
+
+	int fragIdx = pixelToFragIndex(pixelX, pixelY, width, height);
+	Tile& tile = dev_tiles[tileX + tileY * tileGridWidth];
+	int idxInTile = threadIdx.x + threadIdx.y * blockDim.x;
+
+	shared_tileBuffer[idxInTile] = glm::vec4(0.0f, 0.0f, 0.0f, FLT_MAX);
+
+	__syncthreads();
+
+	for (int i = 0; i < tile.numTriangles; i++) {
+		int primId = tile.triangleIndices[i];
+		Primitive& primitive = dev_primitives[primId];
+		glm::vec3 pPix1 = NDCtoPixel(glm::vec3(primitive.v[0].pos), width, height);
+		glm::vec3 pPix2 = NDCtoPixel(glm::vec3(primitive.v[1].pos), width, height);
+		glm::vec3 pPix3 = NDCtoPixel(glm::vec3(primitive.v[2].pos), width, height);
+		glm::vec3 tri[3] = {
+			pPix1,
+			pPix2,
+			pPix3 };
+		glm::ivec4 AABB = computeAABB(width, height, primitive);
+		glm::vec3 bw = calculateBarycentricCoordinate(tri, glm::vec2(pixelX, pixelY));
+		if (isBarycentricCoordInBounds(bw) && pixelInTile(pixelX, pixelY, glm::ivec4(tile.tileMin.x, 
+			tile.tileMin.y, 
+			tile.tileMin.x + TILEX,
+			tile.tileMin.y + TILEY))) {
+			float depth = (depthRange * -getZAtCoordinate(bw, tri));
+			float originalDepth = shared_tileBuffer[idxInTile].w;
+			shared_tileBuffer[idxInTile].w = fminf(originalDepth, depth);
+			if (depth < originalDepth) {
+				glm::vec3 color = primitive.v[0].eyeNor;
+				shared_tileBuffer[idxInTile].x = color.x;
+				shared_tileBuffer[idxInTile].y = color.y;
+				shared_tileBuffer[idxInTile].z = color.z;
+			}
+		}
+	}
+
+	dev_fragmentBuffer[fragIdx].color = glm::vec3(shared_tileBuffer[idxInTile]);
+}
+#endif
+
+__global__
+void shadeLambertian(int width, int height, Fragment* dev_fragmentBuffer, glm::vec3 light) {
+	int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
+	int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
+	if (pixelX * pixelY < width * height) {
+		int fragIdx = pixelToFragIndex(pixelX, pixelY, width, height);
+		dev_fragmentBuffer[fragIdx].color = glm::dot(dev_fragmentBuffer[fragIdx].color, light) * glm::vec3(1.0f, 0.5f, 0.5f);
 	}
 }
 __global__
@@ -1019,7 +1138,8 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 	
 	 //TODO: rasterize
 #if TILERENDER
-	tileRasterizeTriangles << <1, 128 >> >
+	dim3 blockDim2dTiles((width + TILEX - 1) / TILEX, (height + TILEY - 1) / TILEY);
+	tileRasterizeTriangles << <blockDim2dTiles, 1024 >> >
 		(curPrimitiveBeginId,
 			width,
 			height,
@@ -1027,10 +1147,8 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 			dev_fragmentBuffer,
 			dev_depth,
 			depthRange,
-			mutex,
-			2,
-			2);
-	tileRasterizeTriangles << <1, 128 >> >
+			mutex);
+	/*tileRasterizeTriangles << <1, 128 >> >
 		(curPrimitiveBeginId,
 			width,
 			height,
@@ -1040,7 +1158,19 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 			depthRange,
 			mutex,
 			1,
-			1);
+			1);*/
+
+#elif TILERENDERWITHPREPROCESS
+	cudaMemset(dev_triangleIndicesForFrag, 0, width * height * sizeof(int));
+
+	computeTrianglesToBeRendered << <numBlocksForRasterization, threadsPerBlock >> > (
+		curPrimitiveBeginId,
+		width,
+		height,
+		dev_primitives,
+		dev_depth,
+		mutex,
+		dev_triangleIndicesForFrag);
 
 #else
 	rasterizeTriangles << <numBlocksForRasterization, threadsPerBlock >> > 
@@ -1052,12 +1182,14 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 		dev_depth,
 		depthRange,
 		mutex);
-#endif
-	/*shadeLambertian << <numBlocksForRasterization, threadsPerBlock >> > (
-		width * height,
+
+	shadeLambertian << <blockCount2d, blockSize2d >> > (
+		width, height,
 		dev_fragmentBuffer,
 		light);
-*/
+
+#endif
+	
 	//redFragments << <blockCount2d, blockSize2d >> > (width, height, dev_fragmentBuffer);
 	checkCUDAError("rasterization");
 
