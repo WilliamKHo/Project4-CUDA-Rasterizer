@@ -21,9 +21,9 @@
 #define TILERENDER 0
 #define TILERENDERWITHPREPROCESS 1
 //These need to be defined at compile time, but they need to be mathematically sound. TILEX * TILEY = TILESIZE
-#define TILEX 32
-#define TILEY 32
-#define TILESIZE 1024
+#define TILEX 16
+#define TILEY 16
+#define TILESIZE 256
 
 namespace {
 
@@ -1010,7 +1010,8 @@ void tileRasterizeTrianglesAfterPreProcess(
 	int tileGridWidth,
 	Primitive* dev_primitives,
 	Tile* dev_tiles,
-	Fragment* dev_fragmentBuffer) {
+	Fragment* dev_fragmentBuffer,
+	float depthRange) {
 	//Block is tile
 	//Thread is pixel
 	//Loop over the triangles in the bucket
@@ -1042,10 +1043,10 @@ void tileRasterizeTrianglesAfterPreProcess(
 			pPix3 };
 		glm::ivec4 AABB = computeAABB(width, height, primitive);
 		glm::vec3 bw = calculateBarycentricCoordinate(tri, glm::vec2(pixelX, pixelY));
-		if (isBarycentricCoordInBounds(bw) && pixelInTile(pixelX, pixelY, glm::ivec4(tile.tileMin.x, 
-			tile.tileMin.y, 
-			tile.tileMin.x + TILEX,
-			tile.tileMin.y + TILEY))) {
+		if (isBarycentricCoordInBounds(bw) && pixelInTile(pixelX, pixelY, glm::ivec4(tileX * TILEX, 
+			tileY * TILEY, 
+			(tileX + 1) * TILEX,
+			(tileY + 1) * TILEY))) {
 			float depth = (depthRange * -getZAtCoordinate(bw, tri));
 			float originalDepth = shared_tileBuffer[idxInTile].w;
 			shared_tileBuffer[idxInTile].w = fminf(originalDepth, depth);
@@ -1059,6 +1060,16 @@ void tileRasterizeTrianglesAfterPreProcess(
 	}
 
 	dev_fragmentBuffer[fragIdx].color = glm::vec3(shared_tileBuffer[idxInTile]);
+}
+
+__global__
+void colorTileBorders(int width, int height, Fragment* dev_fragmentBuffer) {
+	int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
+	int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
+
+	if ((threadIdx.x == 0 || threadIdx.y == 0) && pixelX < width && pixelY < height) {
+		dev_fragmentBuffer[pixelToFragIndex(pixelX, pixelY, width, height)].color = glm::vec3(1.0f, 0.0f, 0.0f);
+	}
 }
 #endif
 
@@ -1161,17 +1172,40 @@ void rasterize(uchar4 *pbo, const glm::mat4 & MVP, const glm::mat4 & MV, const g
 			1);*/
 
 #elif TILERENDERWITHPREPROCESS
-	cudaMemset(dev_triangleIndicesForFrag, 0, width * height * sizeof(int));
 
 	computeTrianglesToBeRendered << <numBlocksForRasterization, threadsPerBlock >> > (
 		curPrimitiveBeginId,
 		width,
 		height,
+		(width + TILEX - 1) / TILEX,
 		dev_primitives,
-		dev_depth,
-		mutex,
-		dev_triangleIndicesForFrag);
+		dev_tiles,
+		mutex);
 
+	dim3 blockCountForTiles((width + TILEX - 1) / TILEX, (height + TILEY - 1) / TILEY);
+	dim3 blockSizeForTiles(TILEX, TILEY);
+
+	checkCUDAError("triangle bucketing");
+
+	tileRasterizeTrianglesAfterPreProcess<<<blockCountForTiles, blockSizeForTiles>>>(
+		width,
+		height,
+		(width + TILEX - 1) / TILEX,
+		dev_primitives,
+		dev_tiles,
+		dev_fragmentBuffer,
+		depthRange
+	);
+
+	shadeLambertian << <blockCount2d, blockSize2d >> > (
+		width, height,
+		dev_fragmentBuffer,
+		light);
+
+	colorTileBorders << <blockCount2d, blockSize2d >> > (
+		width, 
+		height,
+		dev_fragmentBuffer);
 #else
 	rasterizeTriangles << <numBlocksForRasterization, threadsPerBlock >> > 
 		(curPrimitiveBeginId, 
