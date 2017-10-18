@@ -13,10 +13,12 @@ This is an implementation of a GPU rasterization pipeline, designed to simulate 
 
 ## Basic Rasterizer
 
-//Triangle Image
-//Cube Image
-//Flower Image
-//Cow Image
+| box.gltf | flower.gltf | cow.gltf |
+|:-----:|:-----:|:-----:|
+|![](renders/CubeNormals.PNG)|![](renders/FlowerNormals.PNG)|![](renders/CowNormals2.PNG)|
+|![](renders/CubeLambert.PNG)|![](renders/FlowerLambert.PNG)|![](renders/CowLambert2.PNG)|
+
+
 
 These images are the first images I was able to generate from a basic rasterizer. On an implementation level, I am parallelizing over the primitives in my scene, and iterating through fragment coordinates. These renderings made use of axis-aligned bounding boxes for each primitive to cull the fragments that had to be checked. This optimization, is still quite timely. 
 
@@ -25,6 +27,9 @@ The biggest hurdle in this basic rasterizer is the problem of race conditions th
 ## Additional Feature
 
 ### Tile Based Approach
+
+![](renders/CubeTiled.PNG)
+
 With very limited success, I attempted a tile based approach to rasterizing. This involved a preprocess step of parellelizing over triangles in order to bucket them into their overlapping tiles, and then parallelizing over the tiles. The most significant advantage to this was the ability to use shared memory within tiles to avoid the common global memory accesses to the depth buffer that previously choked my naive rasterizer. With this approach, I was able to speed up the rasterization step considerably for `box.gltf`. With my naive rasterizer on the machine I was working on, I did not succeed in rendering `box.gltf` at higher than `100x100` pixel resolution because the rasterization kernel would exceed the NVIDIA timeout limit. Tiling allowed me to render up to `800x800` pixel resolution. In many ways, this seems promising.
 
 However, a truly robust implementation of this approach would have to overcome several hurdles. First off, as evidenced in the above image, there are many visual artifacts that need to be addressed. More important, preprocessing triangles into buckets requires race condition handling, which, for any mesh with significant numbers of triangles, is far worse than my naive rasterizer implementation. As a result, I have not yet rendered successfully any higher polygon meshes, due to the timeout limit as stated above. 
