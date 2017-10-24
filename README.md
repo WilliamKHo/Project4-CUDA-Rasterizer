@@ -13,10 +13,10 @@ This is an implementation of a GPU rasterization pipeline, designed to simulate 
 
 ## Basic Rasterizer
 
-| box.gltf | flower.gltf | cow.gltf |
-|:-----:|:-----:|:-----:|
-|![](renders/CubeNormals.PNG)|![](renders/FlowerNormals.PNG)|![](renders/CowNormals2.PNG)|
-|![](renders/CubeLambert.PNG)|![](renders/FlowerLambert.PNG)|![](renders/CowLambert2.PNG)|
+|| box.gltf | flower.gltf | cow.gltf |
+|:----:|:-----:|:-----:|:-----:|
+|Fragment Normals|![](renders/CubeNormals.PNG)|![](renders/FlowerNormals.PNG)|![](renders/CowNormals2.PNG)|
+|Lambertian Shading|![](renders/CubeLambert.PNG)|![](renders/FlowerLambert.PNG)|![](renders/CowLambert2.PNG)|
 
 
 
