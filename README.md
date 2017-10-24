@@ -9,7 +9,7 @@ CUDA Rasterizer
 
 ## Overview
 
-This is an implementation of a GPU rasterization pipeline, designed to simulate the OpenGL graphics pipeline. It implements vertex shading, primitive assembly, rasterization, fragment shading, and a framebuffer.
+This is an implementation of a GPU rasterization pipeline, designed to simulate the OpenGL graphics pipeline. It implements vertex shading,rasterization, fragment shading, and a framebuffer.
 
 ## Basic Rasterizer
 
